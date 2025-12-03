@@ -28,7 +28,9 @@ const bootstrapDatabase = async () => {
   }
 };
 
-bootstrapDatabase();
+if (process.env.NODE_ENV !== 'test') {
+  bootstrapDatabase();
+}
 
 app.use(
   cors({
@@ -566,6 +568,10 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`AlarmHosting API listening on http://localhost:${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  app.listen(PORT, () => {
+    console.log(`AlarmHosting API listening on http://localhost:${PORT}`);
+  });
+}
+
+export default app;
