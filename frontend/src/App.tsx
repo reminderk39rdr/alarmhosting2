@@ -1,7 +1,34 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import './App.css';
-import { activityLog, owners, reminders, resources } from './mockData';
-import type { Resource, ResourceType } from './types';
+import { API_BASE_URL } from './config';
+import { fetchSeedData } from './services/dataService';
+import {
+  fetchSessionUser,
+  loginUser,
+  logoutUser,
+} from './services/authService';
+import {
+  getStoredAlertPrefs,
+  setStoredAlertPrefs,
+} from './services/preferencesService';
+import { sendTelegramAction } from './services/telegramService';
+import {
+  fetchCalendarData,
+  buildCsvFromCalendar,
+} from './services/calendarService';
+import { fetchAlertHistory } from './services/alertHistoryService';
+import { createResource } from './services/resourceService';
+import { sendEmailTest, sendSlackTest } from './services/integrationService';
+import type {
+  ActivityItem,
+  AlertPreference,
+  AlertHistoryItem,
+  CalendarResponse,
+  Reminder,
+  Resource,
+  ResourceType,
+  User,
+} from './types';
 
 const dateFormatter = new Intl.DateTimeFormat('id-ID', {
   day: '2-digit',
@@ -47,13 +74,13 @@ const statusClass = {
   overdue: 'badge danger',
 };
 
-const severityClass = {
+const severityClass: Record<Reminder['severity'], string> = {
   low: 'timeline-chip low',
   medium: 'timeline-chip medium',
   high: 'timeline-chip high',
 };
 
-const severityLabel = {
+const severityLabel: Record<Reminder['severity'], string> = {
   low: 'Pengingat awal',
   medium: 'Prioritas menengah',
   high: 'Segera tindakan',
@@ -65,24 +92,281 @@ const formatTimeAgo = (iso: string) => {
   return diff === 1 ? 'Kemarin' : `${diff} hari lalu`;
 };
 
+const getInitials = (name: string) =>
+  name
+    .split(' ')
+    .map((part) => part[0])
+    .join('')
+    .toUpperCase();
+
 function App() {
   const [query, setQuery] = useState('');
-  const [selectedId, setSelectedId] = useState(resources[0]?.id ?? '');
+  const [resources, setResources] = useState<Resource[]>([]);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
+  const [activityLog, setActivityLog] = useState<ActivityItem[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [selectedId, setSelectedId] = useState('');
   const [formAlert, setFormAlert] = useState<string | null>(null);
   const [formState, setFormState] = useState({
     type: 'domain' as ResourceType,
     label: '',
     provider: '',
     expiryDate: '',
-    ownerId: owners[0]?.id ?? '',
-    cadence: '60/30/14/7/3/1',
   });
-
-  const ownerMap = useMemo(
-    () => Object.fromEntries(owners.map((owner) => [owner.id, owner])),
-    []
+  const [currentUserId, setCurrentUserId] = useState('');
+  const [selectedActivity, setSelectedActivity] = useState<
+    (ActivityItem & { resource?: Resource }) | null
+  >(null);
+  const [reloadCounter, setReloadCounter] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [actionPending, setActionPending] = useState(false);
+  const [toastStatus, setToastStatus] = useState<{
+    type: 'success' | 'error';
+    message: string;
+    id: string;
+  } | null>(null);
+  const [integrationPending, setIntegrationPending] = useState(false);
+  const [alertPrefs, setAlertPrefs] = useState<AlertPreference>(
+    getStoredAlertPrefs()
   );
+  const [calendarData, setCalendarData] = useState<CalendarResponse | null>(
+    null
+  );
+  const [calendarPending, setCalendarPending] = useState(false);
+  const [alertHistory, setAlertHistory] = useState<AlertHistoryItem[]>([]);
+  const [resourcePending, setResourcePending] = useState(false);
 
+  useEffect(() => {
+    let isMounted = true;
+    const loadData = async () => {
+      try {
+        const data = await fetchSeedData();
+        if (!isMounted) return;
+        setResources(data.resources);
+        setReminders(data.reminders);
+        setActivityLog(data.activity);
+        setUsers(data.users);
+        setError(null);
+      } catch (err) {
+        if (!isMounted) return;
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Terjadi kesalahan saat memuat data.'
+        );
+      } finally {
+        if (isMounted) setLoading(false);
+      }
+    };
+    loadData();
+    return () => {
+      isMounted = false;
+    };
+  }, [reloadCounter]);
+
+  useEffect(() => {
+    if (!resources.length || !reminders.length) return;
+    let active = true;
+    setCalendarPending(true);
+    fetchCalendarData(reminders, resources, { range: 30 })
+      .then((data) => {
+        if (active) setCalendarData(data);
+      })
+      .catch((error) => {
+        console.warn('[calendar] gagal memuat', error);
+      })
+      .finally(() => {
+        if (active) setCalendarPending(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [resources, reminders]);
+  
+  useEffect(() => {
+    if (!API_BASE_URL) return;
+    fetchAlertHistory(50)
+      .then(setAlertHistory)
+      .catch((error) => {
+        console.warn('[alert-history] gagal memuat', error);
+      });
+  }, [integrationPending]);
+
+  useEffect(() => {
+    if (!selectedId && resources[0]) {
+      setSelectedId(resources[0].id);
+    }
+  }, [resources, selectedId]);
+
+  useEffect(() => {
+    if (!users.length) return;
+    let active = true;
+    fetchSessionUser()
+      .then((userId) => {
+        if (active && userId && users.some((user) => user.id === userId)) {
+          setCurrentUserId(userId);
+        }
+      })
+      .catch((error) => {
+        console.warn('[auth] fetch session failed', error);
+      });
+    return () => {
+      active = false;
+    };
+  }, [users]);
+
+  const currentUser = useMemo(
+    () => users.find((user) => user.id === currentUserId) ?? null,
+    [users, currentUserId]
+  );
+  const adminUser = users.find((user) => user.isAdmin);
+  const [authPending, setAuthPending] = useState(false);
+
+  const handleLogin = async (userId: string) => {
+    if (!users.some((user) => user.id === userId)) return;
+    setAuthPending(true);
+    try {
+      await loginUser(userId);
+      setCurrentUserId(userId);
+      setToastStatus({
+        type: 'success',
+        message: 'Login berhasil.',
+        id: crypto.randomUUID(),
+      });
+    } catch (error) {
+      setToastStatus({
+        type: 'error',
+        message: error instanceof Error ? error.message : 'Login gagal.',
+        id: crypto.randomUUID(),
+      });
+    } finally {
+      setAuthPending(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    setAuthPending(true);
+    try {
+      await logoutUser();
+    } catch (error) {
+      console.warn('[auth] logout failed', error);
+    } finally {
+      setCurrentUserId('');
+      setAuthPending(false);
+    }
+  };
+
+  const handleSwitchToAdmin = () => {
+    if (adminUser) handleLogin(adminUser.id);
+  };
+  const handleSelectActivity = (activity: ActivityItem) => {
+    const resource = resources.find((res) => res.id === activity.resourceId);
+    setSelectedActivity({ ...activity, resource });
+  };
+  const updateAlertPref = (patch: Partial<AlertPreference>) => {
+    setAlertPrefs((prev) => {
+      const next = { ...prev, ...patch };
+      setStoredAlertPrefs(next);
+      return next;
+    });
+  };
+  const handleTelegramAction = async (
+    action: 'preview' | 'snooze' | 'mark_done',
+    reminder: Reminder & { resource?: Resource } | null
+  ) => {
+    if (!reminder) {
+      setToastStatus({
+        type: 'error',
+        message: 'Tidak ada reminder yang dipilih.',
+        id: crypto.randomUUID(),
+      });
+      return;
+    }
+    setActionPending(true);
+    setToastStatus(null);
+    try {
+      await sendTelegramAction({
+        reminderId: reminder.id,
+        action,
+        metadata: {
+          resource: reminder.resource?.label ?? reminder.resourceId,
+        },
+      });
+      const successMap = {
+        preview: 'Preview terkirim ke Telegram.',
+        snooze: 'Reminder disnooze 3 hari.',
+        mark_done: 'Reminder ditandai selesai.',
+      };
+      setToastStatus({
+        type: 'success',
+        message: successMap[action],
+        id: crypto.randomUUID(),
+      });
+    } catch (err) {
+      setToastStatus({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Gagal mengirim aksi Telegram.',
+        id: crypto.randomUUID(),
+      });
+    } finally {
+      setActionPending(false);
+    }
+  };
+  const handleIntegrationTest = async (channel: 'email' | 'slack') => {
+    setIntegrationPending(true);
+    setToastStatus(null);
+    try {
+      if (channel === 'email') {
+        await sendEmailTest(alertPrefs.emailEnabled ? alertPrefs.email : '');
+        setToastStatus({
+          type: 'success',
+          message: `Email test dikirim ke ${alertPrefs.email}.`,
+          id: crypto.randomUUID(),
+        });
+      } else {
+        await sendSlackTest(
+          alertPrefs.slackEnabled ? alertPrefs.slackChannel : ''
+        );
+        setToastStatus({
+          type: 'success',
+          message: `Notifikasi Slack dikirim ke ${alertPrefs.slackChannel}.`,
+          id: crypto.randomUUID(),
+        });
+      }
+    } catch (err) {
+      setToastStatus({
+        type: 'error',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Gagal mengirim notifikasi.',
+        id: crypto.randomUUID(),
+      });
+    } finally {
+      setIntegrationPending(false);
+    }
+  };
+
+  const handleExportCalendar = () => {
+    if (API_BASE_URL) {
+      const exportUrl = `${API_BASE_URL}/reports/upcoming?format=csv`;
+      window.open(exportUrl, '_blank', 'noopener');
+      return;
+    }
+    if (!calendarData) return;
+    const csv = buildCsvFromCalendar(calendarData);
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = 'upcoming.csv';
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
   const filteredResources = useMemo(() => {
     if (!query.trim()) return resources;
     const lower = query.toLowerCase();
@@ -92,7 +376,7 @@ function App() {
         res.hostname.toLowerCase().includes(lower) ||
         res.provider.toLowerCase().includes(lower)
     );
-  }, [query]);
+  }, [query, resources]);
 
   const sortedResources = useMemo(
     () =>
@@ -104,7 +388,7 @@ function App() {
   );
 
   const selectedResource =
-    resources.find((item) => item.id === selectedId) ?? resources[0];
+    resources.find((item) => item.id === selectedId) ?? null;
 
   const stats = useMemo(() => {
     const total = resources.length;
@@ -112,9 +396,8 @@ function App() {
       (res) => res.status !== 'overdue' && getDaysUntil(res.expiryDate) <= 7
     ).length;
     const overdue = resources.filter((res) => res.status === 'overdue').length;
-    const unassigned = resources.filter((res) => !res.ownerId).length;
-    return { total, dueThisWeek, overdue, unassigned };
-  }, []);
+    return { total, dueThisWeek, overdue };
+  }, [resources]);
 
   const timeline = useMemo(
     () =>
@@ -125,7 +408,7 @@ function App() {
           ...item,
           resource: resources.find((res) => res.id === item.resourceId),
         })),
-    []
+    [reminders, resources]
   );
 
   const upcomingBuckets = useMemo(() => {
@@ -141,200 +424,421 @@ function App() {
       else buckets.later.push(res);
     });
     return buckets;
-  }, []);
+  }, [resources]);
+  const canViewLog = currentUser?.isAdmin ?? false;
+  const nextReminder = useMemo(() => {
+    if (!reminders.length) return null;
+    const next = reminders
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(a.scheduledFor).getTime() -
+          new Date(b.scheduledFor).getTime()
+      )[0];
+    return {
+      ...next,
+      resource: resources.find((res) => res.id === next.resourceId),
+    };
+  }, [reminders, resources]);
+  const personalQueue = useMemo(
+    () => reminders.filter((item) => item.dueInDays <= 7),
+    [reminders]
+  );
+  const personalDueSoon = personalQueue.filter((item) => item.dueInDays >= 0).length;
+  const personalOverdue = personalQueue.length - personalDueSoon;
 
-  const onSubmitForm = (event: React.FormEvent<HTMLFormElement>) => {
+  if (loading) {
+    return (
+      <div className="layout status-layout">
+        <div className="status-card">
+          <p>Memuat data dashboard...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="layout status-layout">
+        <div className="status-card">
+          <p>{error}</p>
+          <button className="primary" onClick={() => window.location.reload()}>
+            Muat ulang
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const onSubmitForm = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!formState.label || !formState.expiryDate || !formState.provider) {
       setFormAlert('Lengkapi nama resource, provider, dan tanggal.');
       return;
     }
-    setFormAlert(
-      `Draft reminder ${formState.label} siap dikirim ke bot Telegram.`
-    );
-    setFormState((prev) => ({
-      ...prev,
-      label: '',
-      provider: '',
-      expiryDate: '',
-    }));
+    setResourcePending(true);
+    setFormAlert(null);
+    try {
+      const created = await createResource(formState);
+      if (API_BASE_URL) {
+        setReloadCounter((prev) => prev + 1);
+      } else {
+        setResources((prev) => [...prev, created]);
+      }
+      setFormAlert(`Resource ${created.label} berhasil disimpan.`);
+      setFormState((prev) => ({
+        ...prev,
+        label: '',
+        provider: '',
+        expiryDate: '',
+      }));
+    } catch (error) {
+      setFormAlert(
+        error instanceof Error ? error.message : 'Gagal menyimpan resource.'
+      );
+    } finally {
+      setResourcePending(false);
+    }
   };
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-icon">⏰</div>
+    <div className="layout">
+      <header className="topbar">
+        <div className="logo-block">
+          <div className="logo-mark">AH</div>
           <div>
-            <p className="brand-title">Alarm Hosting</p>
-            <p className="brand-caption">Reminder Command Center</p>
+            <p className="brand-name">Alarm Hosting</p>
+            <p className="brand-subtitle">Domain & Hosting Renewal</p>
           </div>
         </div>
-        <nav>
-          <p className="nav-label">Monitor</p>
-          <button className="nav-item active">Dashboard</button>
-          <button className="nav-item">Calendar</button>
-          <button className="nav-item">Telegram Bot</button>
-          <p className="nav-label spacer">Resources</p>
-          <button className="nav-item">Domains</button>
-          <button className="nav-item">Hosting</button>
-          <button className="nav-item">SSL & Layanan</button>
+        <nav className="top-nav">
+          <button className="top-nav-item active">Command Center</button>
+          <button className="top-nav-item">Calendar</button>
+          <button className="top-nav-item">Telegram Bot</button>
+          <button className="top-nav-item">Reports</button>
         </nav>
-        <div className="sidebar-card">
-          <p>Progress migrasi Niagahoster</p>
-          <h3>3/6 layanan sudah aman</h3>
-          <p className="muted">
-            Update lagi sebelum akhir minggu supaya tim tahu statusnya.
-          </p>
-          <button className="secondary-btn">Laporkan perkembangan</button>
-        </div>
-      </aside>
-
-      <main className="main-area">
-        <header className="page-header">
-          <div>
-            <p className="eyebrow">Operational Reminder • Asia/Jakarta</p>
-            <h1>Renewal Radar</h1>
+          <div className="top-actions">
+            <div className="search-control">
+            <input
+              type="text"
+              placeholder="Cari resource atau provider"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+            <span>⌘K</span>
           </div>
-          <div className="header-actions">
-            <div className="search-box">
-              <span role="img" aria-label="search">
-                🔍
-              </span>
-              <input
-                type="text"
-                placeholder="Cari domain, hosting, atau provider..."
-                value={query}
-                onChange={(event) => setQuery(event.target.value)}
-              />
+          <button className="ghost">Create brief</button>
+          {currentUser ? (
+            <div className="session-pill">
+              <div>
+                <p className="session-name">{currentUser.name}</p>
+                <p className="session-role">
+                  {currentUser.role}
+                  {currentUser.isAdmin ? ' • Admin' : ''}
+                </p>
+              </div>
+              <div className="avatar small">
+                {currentUser.avatar ? (
+                  <img src={currentUser.avatar} alt={currentUser.name} />
+                ) : (
+                  <span>{getInitials(currentUser.name)}</span>
+                )}
+              </div>
             </div>
-            <button className="primary-btn">+ Reminder Baru</button>
-          </div>
-        </header>
+          ) : (
+            <button
+              className="primary"
+              onClick={() => setCurrentUserId(users[0]?.id ?? '')}
+            >
+              Login
+            </button>
+          )}
+        </div>
+      </header>
 
-        <section className="stats-grid">
-          <StatCard
-            title="Total Resources"
-            value={stats.total}
-            detail={`${upcomingBuckets.month.length} jatuh tempo < 30 hari`}
+      <main className="page">
+        <section className="hero">
+          <div>
+            <p className="eyebrow">
+              {currentUser?.isAdmin ? 'Renewal overview — Asia/Jakarta' : 'My action queue'}
+            </p>
+            <h1>
+              {currentUser?.isAdmin ? 'Renewal Command Center' : 'Workboard'}{' '}
+              <span>
+                {currentUser?.isAdmin
+                  ? 'Dashboard'
+                  : currentUser?.name.split(' ')[0] ?? 'Guest'}
+              </span>
+            </h1>
+            <p className="hero-copy">
+              {currentUser?.isAdmin
+                ? 'KPI ringkas untuk domain & layanan hosting kritikal. Data siap dikirim ke channel Telegram.'
+                : 'Lihat pengingat mendesak dan simulasi pesan Telegram sebelum broadcast.'}
+            </p>
+            <div className="hero-actions">
+              {currentUser?.isAdmin ? (
+                <>
+                  <button className="primary">+ Reminder Baru</button>
+                  <button className="ghost">Sinkronisasi bot</button>
+                </>
+              ) : (
+                <>
+                  <button className="primary">Mulai review hari ini</button>
+                  <button className="ghost">Lihat calendar</button>
+                </>
+              )}
+            </div>
+          </div>
+          <div className="hero-panel">
+            {currentUser?.isAdmin ? (
+              <>
+                <p>Service Health</p>
+                <div className="hero-stats">
+                  <div>
+                    <p className="hero-value">{stats.total}</p>
+                    <p className="muted">Total resources</p>
+                  </div>
+                  <div>
+                    <p className="hero-value warning">{stats.dueThisWeek}</p>
+                    <p className="muted">Due &lt; 7 hari</p>
+                  </div>
+                  <div>
+                    <p className="hero-value danger">{stats.overdue}</p>
+                    <p className="muted">Overdue</p>
+                  </div>
+                </div>
+                <div className="hero-foot">
+                  <p>Next Telegram blast</p>
+                  <p className="hero-foot-date">Senin, 09:00 WIB</p>
+                </div>
+              </>
+            ) : (
+              <>
+                <p>My Tasks</p>
+                <div className="hero-stats">
+                  <div>
+                    <p className="hero-value">{personalQueue.length}</p>
+                    <p className="muted">Reminder ≤ 7 hari</p>
+                  </div>
+                  <div>
+                    <p className="hero-value warning">{personalDueSoon}</p>
+                    <p className="muted">Butuh follow up</p>
+                  </div>
+                  <div>
+                    <p className="hero-value danger">{personalOverdue}</p>
+                    <p className="muted">Overdue</p>
+                  </div>
+                </div>
+                <div className="hero-foot">
+                  <p>Prioritas Anda</p>
+                  <p className="hero-foot-date">
+                    {personalQueue[0]
+                      ? shortFormatter.format(
+                          new Date(personalQueue[0].scheduledFor)
+                        )
+                      : 'Semua aman'}
+                  </p>
+                </div>
+              </>
+            )}
+          </div>
+        </section>
+
+        <section className="key-metrics">
+          <InsightCard
+            title="Critical queue"
+            value={`${upcomingBuckets.week.length}`}
+            description="Resource jatuh tempo ≤ 7 hari."
           />
-          <StatCard
-            title="Due < 7 hari"
-            value={stats.dueThisWeek}
-            tone="warning"
-            detail="Prioritas tinggi minggu ini"
+          <InsightCard
+            title="Waiting confirmation"
+            value={`${reminders.filter((r) => r.dueInDays <= 0).length}`}
+            description="Reminder terkirim yang belum closing."
           />
-          <StatCard
-            title="Overdue"
-            value={stats.overdue}
-            tone="danger"
-            detail="Segera follow up via Telegram"
-          />
-          <StatCard
-            title="Tanpa PIC"
-            value={stats.unassigned}
-            tone="muted"
-            detail="Assign PIC sebelum reminder"
+          <InsightCard
+            title="Next broadcast"
+            value={
+              nextReminder
+                ? shortFormatter.format(new Date(nextReminder.scheduledFor))
+                : '-'
+            }
+            description="Jadwal Telegram terdekat."
           />
         </section>
 
-        <section className="content-grid">
-          <div className="card">
-            <div className="card-header">
+        <section className="main-grid">
+          <div className="card resource-card">
+            <div className="card-head">
               <div>
-                <p className="eyebrow">Upcoming Reminder</p>
+                <p className="eyebrow">Renewal pipeline</p>
                 <h2>Prioritas 30 Hari</h2>
               </div>
-              <div className="filter-chips">
+              <div className="chip-row">
                 <span className="chip">Minggu ini {upcomingBuckets.week.length}</span>
                 <span className="chip">30 hari {upcomingBuckets.month.length}</span>
-                <span className="chip">&gt; 30 hari {upcomingBuckets.later.length}</span>
+                <span className="chip muted">&gt; 30 hari {upcomingBuckets.later.length}</span>
               </div>
             </div>
             <ResourceTable
               resources={sortedResources}
               selectedId={selectedId}
-              ownerMap={ownerMap}
               onSelect={setSelectedId}
             />
+            <div className="resource-detail-block">
+              <div className="detail-block-head">
+                <p className="eyebrow">Selected asset</p>
+                <button className="ghost small">Bagikan ke Telegram</button>
+              </div>
+              {selectedResource ? (
+                <ResourceDetail
+                  resource={selectedResource}
+                  currentUser={currentUser}
+                  getDaysUntil={getDaysUntil}
+                />
+              ) : (
+                <p className="muted">Pilih resource untuk melihat detail.</p>
+              )}
+            </div>
           </div>
 
-          <div className="timeline-column">
+          <div className="compact-column">
             <div className="card">
-              <div className="card-header">
+              <div className="card-head">
                 <div>
-                  <p className="eyebrow">Telegram Queue</p>
-                  <h2>Jadwal Pengingat</h2>
+                  <p className="eyebrow">Upcoming reminders</p>
+                  <h2>Timeline & Preview</h2>
                 </div>
-                <button className="ghost-btn">Manage cadence</button>
+                <button className="ghost small">Kelola jadwal</button>
               </div>
-              <Timeline timeline={timeline} />
+              <Timeline
+                timeline={timeline}
+                limit={3}
+                onAction={handleTelegramAction}
+                actionPending={actionPending}
+              />
+              <TelegramPreview
+                reminder={nextReminder}
+                actionPending={actionPending}
+                onAction={handleTelegramAction}
+              />
             </div>
 
-            <div className="card">
-              <div className="card-header">
+            <div className="card calendar-entry-card">
+              <div className="card-head">
                 <div>
-                  <p className="eyebrow">Tambah Reminder</p>
-                  <h2>Resource Baru</h2>
+                  <p className="eyebrow">Calendar & Entry</p>
+                  <h2>Agenda & Draft</h2>
                 </div>
+                <button className="ghost small" onClick={handleExportCalendar}>
+                  Export CSV
+                </button>
               </div>
+              {calendarPending ? (
+                <p className="muted">Memuat kalender...</p>
+              ) : (
+                <CalendarBoard calendarDays={calendarData?.days ?? []} />
+              )}
+              <div className="divider" />
               <QuickAddForm
                 formState={formState}
                 setFormState={setFormState}
-                owners={owners}
                 onSubmit={onSubmitForm}
                 alert={formAlert}
+                pending={resourcePending}
               />
             </div>
-          </div>
 
-          <div className="detail-column">
             <div className="card">
-              <div className="card-header">
+              <div className="card-head">
                 <div>
-                  <p className="eyebrow">Detail Resource</p>
-                  <h2>{selectedResource?.label ?? 'Pilih resource'}</h2>
+                  <p className="eyebrow">Alert center</p>
+                  <h2>Email & Slack</h2>
                 </div>
-                <button className="ghost-btn">Kirim ke Telegram</button>
               </div>
-              {selectedResource && (
-                <ResourceDetail
-                  resource={selectedResource}
-                  owner={ownerMap[selectedResource.ownerId]}
-                  getDaysUntil={getDaysUntil}
+              <AlertingPanel
+                prefs={alertPrefs}
+                onChange={updateAlertPref}
+                onTest={handleIntegrationTest}
+                pending={integrationPending}
+              />
+            </div>
+
+            <div className="card">
+              <div className="card-head">
+                <div>
+                  <p className="eyebrow">Alert history</p>
+                  <h2>Email/Slack/Telegram</h2>
+                </div>
+              </div>
+              <AlertHistoryList items={alertHistory} />
+            </div>
+
+            <div className={`card ${!canViewLog ? 'locked' : ''}`}>
+              <div className="card-head">
+                <div>
+                  <p className="eyebrow">Activity log</p>
+                  <h2>Timeline Operasional</h2>
+                </div>
+                <button className="ghost small">Export CSV</button>
+              </div>
+              {canViewLog ? (
+                <ActivityFeed
+                  activityLog={activityLog}
+                  onSelect={handleSelectActivity}
                 />
+              ) : (
+                <div className="locked-state">
+                  <p>Log hanya tersedia untuk admin.</p>
+                  {adminUser && (
+                    <button className="primary" onClick={handleSwitchToAdmin}>
+                      Login sebagai {adminUser.name.split(' ')[0]}
+                    </button>
+                  )}
+                </div>
               )}
             </div>
 
-            <div className="card">
-              <div className="card-header">
-                <div>
-                  <p className="eyebrow">Aktivitas Terbaru</p>
-                  <h2>Log Reminder</h2>
-                </div>
-                <button className="ghost-btn">Export</button>
-              </div>
-              <ActivityFeed />
-            </div>
+            <UserAccessCard
+              users={users}
+              currentUserId={currentUserId}
+              onLogin={handleLogin}
+              onLogout={handleLogout}
+            />
           </div>
         </section>
       </main>
+      {canViewLog && selectedActivity && (
+        <ActivityModal
+          item={selectedActivity}
+          onClose={() => setSelectedActivity(null)}
+        />
+      )}
+      {toastStatus && (
+        <Toast
+          status={toastStatus}
+          onDismiss={() => setToastStatus(null)}
+        />
+      )}
+      {!currentUser && users.length > 0 && (
+        <LoginPanel users={users} onLogin={handleLogin} pending={authPending} />
+      )}
     </div>
   );
 }
 
-interface StatProps {
+const InsightCard = ({
+  title,
+  value,
+  description,
+}: {
   title: string;
-  value: number;
-  detail: string;
-  tone?: 'warning' | 'danger' | 'muted';
-}
-
-const StatCard = ({ title, value, detail, tone }: StatProps) => (
-  <div className={`stat-card ${tone ?? ''}`}>
-    <p className="stat-title">{title}</p>
-    <p className="stat-value">{value}</p>
-    <p className="stat-detail">{detail}</p>
+  value: string;
+  description: string;
+}) => (
+  <div className="insight-card">
+    <p className="insight-title">{title}</p>
+    <p className="insight-value">{value}</p>
+    <p className="muted">{description}</p>
   </div>
 );
 
@@ -342,14 +846,12 @@ interface ResourceTableProps {
   resources: Resource[];
   selectedId: string;
   onSelect: (id: string) => void;
-  ownerMap: Record<string, (typeof owners)[number]>;
 }
 
 const ResourceTable = ({
   resources,
   selectedId,
   onSelect,
-  ownerMap,
 }: ResourceTableProps) => (
   <div className="table-wrapper">
     <table>
@@ -358,7 +860,7 @@ const ResourceTable = ({
           <th>Resource</th>
           <th>Penyedia</th>
           <th>Expiry</th>
-          <th>Owner</th>
+          <th>Channel</th>
           <th>Status</th>
         </tr>
       </thead>
@@ -382,29 +884,19 @@ const ResourceTable = ({
             </td>
             <td>
               <p>{resource.provider}</p>
-              <p className="muted">{resource.cadence} harian</p>
+              <p className="muted">
+                Cek {formatTimeAgo(resource.lastChecked)}
+              </p>
             </td>
             <td>
               <p>{dateFormatter.format(new Date(resource.expiryDate))}</p>
-              <p className="muted">{getDaysUntil(resource.expiryDate)} hari lagi</p>
+              <p className="muted">
+                {getDaysUntil(resource.expiryDate)} hari lagi
+              </p>
             </td>
             <td>
-              <div className="owner-cell">
-                {ownerMap[resource.ownerId]?.avatar ? (
-                  <img
-                    src={ownerMap[resource.ownerId].avatar}
-                    alt={ownerMap[resource.ownerId].name}
-                  />
-                ) : (
-                  <div className="avatar-fallback">?</div>
-                )}
-                <div>
-                  <p>{ownerMap[resource.ownerId]?.name ?? 'Belum ada'}</p>
-                  <p className="muted">
-                    {ownerMap[resource.ownerId]?.role ?? 'Assign PIC'}
-                  </p>
-                </div>
-              </div>
+              <p>Telegram</p>
+              <p className="muted">Broadcast otomatis</p>
             </td>
             <td>
               <span className={statusClass[resource.status]}>
@@ -419,14 +911,18 @@ const ResourceTable = ({
 );
 
 interface TimelineProps {
-  timeline: Array<
-    (typeof reminders)[number] & { resource?: Resource }
-  >;
+  timeline: Array<Reminder & { resource?: Resource }>;
+  limit?: number;
+  onAction: (
+    action: 'preview' | 'snooze' | 'mark_done',
+    reminder: Reminder & { resource?: Resource }
+  ) => void;
+  actionPending: boolean;
 }
 
-const Timeline = ({ timeline }: TimelineProps) => (
+const Timeline = ({ timeline, limit, onAction, actionPending }: TimelineProps) => (
   <ul className="timeline-list">
-    {timeline.map((item) => (
+    {timeline.slice(0, limit ?? timeline.length).map((item) => (
       <li key={item.id}>
         <div className="timeline-date">
           <p>{item.dueInDays >= 0 ? `T-${item.dueInDays}` : `+${Math.abs(item.dueInDays)}`}</p>
@@ -442,7 +938,29 @@ const Timeline = ({ timeline }: TimelineProps) => (
           <p className="muted">{item.message}</p>
           <div className="timeline-footer">
             <span>{typeLabels[item.resource?.type ?? 'domain']}</span>
-            <button className="ghost-btn">Edit cadence</button>
+            <div className="timeline-actions">
+              <button
+                className="ghost small"
+                disabled={actionPending}
+                onClick={() => onAction('preview', item)}
+              >
+                Preview
+              </button>
+              <button
+                className="ghost small"
+                disabled={actionPending}
+                onClick={() => onAction('snooze', item)}
+              >
+                Snooze 3d
+              </button>
+              <button
+                className="ghost small"
+                disabled={actionPending}
+                onClick={() => onAction('mark_done', item)}
+              >
+                Mark done
+              </button>
+            </div>
           </div>
         </div>
       </li>
@@ -450,14 +968,110 @@ const Timeline = ({ timeline }: TimelineProps) => (
   </ul>
 );
 
+interface CalendarBoardProps {
+  calendarDays: CalendarResponse['days'];
+}
+
+const CalendarBoard = ({ calendarDays }: CalendarBoardProps) => {
+  if (!calendarDays.length) {
+    return <p className="muted">Belum ada agenda.</p>;
+  }
+
+  return (
+    <ul className="calendar-list">
+      {calendarDays.map(({ date, events }: CalendarResponse['days'][number]) => (
+        <li key={date}>
+          <div className="calendar-date">
+            <p>{shortFormatter.format(new Date(date))}</p>
+            <span>{events.length} agenda</span>
+          </div>
+          <div className="calendar-events">
+            {events.slice(0, 2).map((item) => (
+              <div key={item.id} className="calendar-event">
+                <p>{item.resource?.label ?? 'Resource'}</p>
+                <span className={`badge severity-${item.severity}`}>
+                  {item.channel}
+                </span>
+              </div>
+            ))}
+            {events.length > 2 && (
+              <p className="muted">+{events.length - 2} lainnya</p>
+            )}
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+};
+
+const TelegramPreview = ({
+  reminder,
+  actionPending,
+  onAction,
+}: {
+  reminder: (Reminder & { resource?: Resource }) | null;
+  actionPending: boolean;
+  onAction: (
+    action: 'preview' | 'snooze' | 'mark_done',
+    reminder: Reminder & { resource?: Resource } | null
+  ) => void;
+}) => {
+  if (!reminder) {
+    return (
+      <div className="telegram-preview">
+        <p className="muted">Belum ada reminder yang dijadwalkan.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="telegram-preview">
+      <div className="telegram-header">
+        <p>Telegram Bot</p>
+        <span>draft</span>
+      </div>
+      <div className="telegram-body">
+        <p>
+          [Reminder] {reminder.resource?.label ?? reminder.resourceId}{' '}
+          akan kedaluwarsa{' '}
+          {shortFormatter.format(new Date(reminder.scheduledFor))}. Status:{' '}
+          {statusLabel[reminder.resource?.status ?? 'due-soon']}
+        </p>
+        <p className="muted">{reminder.message}</p>
+      </div>
+      <div className="telegram-actions">
+        <button
+          className="ghost small"
+          disabled={actionPending}
+          onClick={() => onAction('mark_done', reminder)}
+        >
+          Mark done
+        </button>
+        <button
+          className="ghost small"
+          disabled={actionPending}
+          onClick={() => onAction('snooze', reminder)}
+        >
+          Snooze 3 hari
+        </button>
+        <button
+          className="primary"
+          disabled={actionPending}
+          onClick={() => onAction('preview', reminder)}
+        >
+          {actionPending ? 'Mengirim...' : 'Kirim preview'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
 interface QuickAddFormProps {
   formState: {
     type: ResourceType;
     label: string;
     provider: string;
     expiryDate: string;
-    ownerId: string;
-    cadence: string;
   };
   setFormState: React.Dispatch<
     React.SetStateAction<{
@@ -465,21 +1079,19 @@ interface QuickAddFormProps {
       label: string;
       provider: string;
       expiryDate: string;
-      ownerId: string;
-      cadence: string;
     }>
   >;
-  owners: typeof owners;
   onSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   alert: string | null;
+  pending: boolean;
 }
 
 const QuickAddForm = ({
   formState,
   setFormState,
-  owners,
   onSubmit,
   alert,
+  pending,
 }: QuickAddFormProps) => (
   <form className="quick-form" onSubmit={onSubmit}>
     <label>
@@ -532,45 +1144,217 @@ const QuickAddForm = ({
         }
       />
     </label>
-    <label>
-      PIC Reminder
-      <select
-        value={formState.ownerId}
-        onChange={(event) =>
-          setFormState((prev) => ({ ...prev, ownerId: event.target.value }))
-        }
-      >
-        {owners.map((owner) => (
-          <option key={owner.id} value={owner.id}>
-            {owner.name} • {owner.role}
-          </option>
-        ))}
-      </select>
-    </label>
-    <label>
-      Cadence (hari)
-      <input
-        type="text"
-        value={formState.cadence}
-        onChange={(event) =>
-          setFormState((prev) => ({ ...prev, cadence: event.target.value }))
-        }
-      />
-    </label>
     {alert && <p className="form-alert">{alert}</p>}
-    <button className="primary-btn" type="submit">
-      Simpan Draft Reminder
+    <button className="primary" type="submit" disabled={pending}>
+      {pending ? 'Menyimpan...' : 'Simpan Draft Reminder'}
     </button>
   </form>
 );
 
+const AlertingPanel = ({
+  prefs,
+  onChange,
+  onTest,
+  pending,
+}: {
+  prefs: AlertPreference;
+  onChange: (patch: Partial<AlertPreference>) => void;
+  onTest: (channel: 'email' | 'slack') => void;
+  pending: boolean;
+}) => (
+  <div className="alerting-panel">
+    <section>
+      <label className="toggle-row">
+        <span>Email alert</span>
+        <input
+          type="checkbox"
+          checked={prefs.emailEnabled}
+          onChange={(event) =>
+            onChange({ emailEnabled: event.target.checked })
+          }
+        />
+      </label>
+      <input
+        type="email"
+        placeholder="ops@company.id"
+        value={prefs.email}
+        onChange={(event) => onChange({ email: event.target.value })}
+        disabled={!prefs.emailEnabled}
+      />
+      <button
+        className="ghost small"
+        disabled={!prefs.emailEnabled || pending}
+        onClick={() => onTest('email')}
+      >
+        {pending ? 'Mengirim...' : 'Kirim test email'}
+      </button>
+    </section>
+    <section>
+      <label className="toggle-row">
+        <span>Slack alert</span>
+        <input
+          type="checkbox"
+          checked={prefs.slackEnabled}
+          onChange={(event) =>
+            onChange({ slackEnabled: event.target.checked })
+          }
+        />
+      </label>
+      <input
+        type="text"
+        placeholder="#ops-alert"
+        value={prefs.slackChannel}
+        onChange={(event) => onChange({ slackChannel: event.target.value })}
+        disabled={!prefs.slackEnabled}
+      />
+      <button
+        className="ghost small"
+        disabled={!prefs.slackEnabled || pending}
+        onClick={() => onTest('slack')}
+      >
+        {pending ? 'Mengirim...' : 'Ping Slack'}
+      </button>
+    </section>
+  </div>
+);
+
+const AlertHistoryList = ({ items }: { items: AlertHistoryItem[] }) => {
+  if (!items.length) {
+    return <p className="muted">Belum ada alert yang dikirim.</p>;
+  }
+  return (
+    <ul className="alert-history">
+      {items.map((item) => (
+        <li key={item.id}>
+          <div>
+            <p className="resource-name">
+              {item.channel.toUpperCase()} • {item.target}
+            </p>
+            <p className="muted">
+              {new Date(item.sentAt).toLocaleString('id-ID')} • {item.status}
+            </p>
+          </div>
+          {item.error && <span className="error-text">{item.error}</span>}
+        </li>
+      ))}
+    </ul>
+  );
+};
+
+const UserAccessCard = ({
+  users,
+  currentUserId,
+  onLogin,
+  onLogout,
+}: {
+  users: User[];
+  currentUserId: string;
+  onLogin: (id: string) => void;
+  onLogout: () => void;
+}) => (
+  <div className="card">
+    <div className="card-head">
+      <div>
+        <p className="eyebrow">Multi user access</p>
+        <h2>Login & Permissions</h2>
+      </div>
+    </div>
+    <div className="session-list">
+      {users.map((user) => {
+        const isActive = user.id === currentUserId;
+        return (
+          <div key={user.id} className={`session-item ${isActive ? 'active' : ''}`}>
+            <div className="owner-inline">
+              <div className="avatar small">
+                {user.avatar ? (
+                  <img src={user.avatar} alt={user.name} />
+                ) : (
+                  <span>{getInitials(user.name)}</span>
+                )}
+              </div>
+              <div>
+                <p className="resource-name">{user.name}</p>
+                <p className="muted">
+                  {user.role}
+                  {user.isAdmin ? ' • Admin' : ''}
+                </p>
+              </div>
+            </div>
+            {isActive ? (
+              <button className="ghost small" onClick={onLogout}>
+                Logout
+              </button>
+            ) : (
+              <button className="ghost small" onClick={() => onLogin(user.id)}>
+                Login
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  </div>
+);
+
+const LoginPanel = ({
+  users,
+  onLogin,
+  pending,
+}: {
+  users: User[];
+  onLogin: (id: string) => void;
+  pending: boolean;
+}) => (
+  <div className="login-overlay">
+    <div className="login-card">
+      <h2>Pilih akun untuk mulai</h2>
+      <p className="muted">
+        Hubungkan dashboard dengan user Telegram yang memiliki izin.
+      </p>
+      <div className="login-card-grid">
+        {users.map((user) => (
+          <button
+            key={user.id}
+            className="login-option"
+            onClick={() => onLogin(user.id)}
+            disabled={pending}
+          >
+            <div className="owner-inline">
+              <div className="avatar small">
+                {user.avatar ? (
+                  <img src={user.avatar} alt={user.name} />
+                ) : (
+                  <span>{getInitials(user.name)}</span>
+                )}
+              </div>
+              <div>
+                <p className="resource-name">{user.name}</p>
+                <p className="muted">
+                  {user.role}
+                  {user.isAdmin ? ' • Admin' : ''}
+                </p>
+              </div>
+            </div>
+            <span>Login</span>
+          </button>
+        ))}
+      </div>
+      {pending && <p className="muted">Memproses...</p>}
+    </div>
+  </div>
+);
+
 interface ResourceDetailProps {
   resource: Resource;
-  owner: (typeof owners)[number] | undefined;
+  currentUser: User | null;
   getDaysUntil: (iso: string) => number;
 }
 
-const ResourceDetail = ({ resource, owner, getDaysUntil }: ResourceDetailProps) => (
+const ResourceDetail = ({
+  resource,
+  currentUser,
+  getDaysUntil,
+}: ResourceDetailProps) => (
   <div className="resource-detail">
     <div className="detail-row">
       <p className="detail-label">Hostname</p>
@@ -588,22 +1372,20 @@ const ResourceDetail = ({ resource, owner, getDaysUntil }: ResourceDetailProps) 
       </p>
     </div>
     <div className="detail-row">
-      <p className="detail-label">Cadence</p>
-      <p className="detail-value">{resource.cadence} hari</p>
+      <p className="detail-label">Terakhir dicek</p>
+      <p className="detail-value">
+        {dateFormatter.format(new Date(resource.lastChecked))}
+      </p>
     </div>
     <div className="detail-row">
-      <p className="detail-label">PIC di Telegram</p>
-      <div className="owner-inline">
-        {owner?.avatar ? (
-          <img src={owner.avatar} alt={owner.name} />
-        ) : (
-          <div className="avatar-fallback">?</div>
-        )}
-        <div>
-          <p>{owner?.name ?? 'Belum ditentukan'}</p>
-          <p className="muted">{owner?.role ?? 'Assign terlebih dahulu'}</p>
-        </div>
-      </div>
+      <p className="detail-label">Hak akses</p>
+      <p className="detail-value">
+        {currentUser
+          ? `${currentUser.name} • ${
+              currentUser.isAdmin ? 'Admin' : 'Standard user'
+            }`
+          : 'Belum login'}
+      </p>
     </div>
     <div className="detail-row">
       <p className="detail-label">Renewal Link</p>
@@ -625,10 +1407,20 @@ const ResourceDetail = ({ resource, owner, getDaysUntil }: ResourceDetailProps) 
   </div>
 );
 
-const ActivityFeed = () => (
+const ActivityFeed = ({
+  activityLog,
+  onSelect,
+}: {
+  activityLog: ActivityItem[];
+  onSelect?: (item: ActivityItem) => void;
+}) => (
   <ul className="activity-list">
     {activityLog.map((item) => (
-      <li key={item.id}>
+      <li
+        key={item.id}
+        className={onSelect ? 'clickable' : ''}
+        onClick={() => onSelect?.(item)}
+      >
         <div>
           <p>{item.label}</p>
           <p className="muted">
@@ -641,6 +1433,50 @@ const ActivityFeed = () => (
       </li>
     ))}
   </ul>
+);
+
+const ActivityModal = ({
+  item,
+  onClose,
+}: {
+  item: ActivityItem & { resource?: Resource };
+  onClose: () => void;
+}) => (
+  <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal" onClick={(event) => event.stopPropagation()}>
+      <div className="modal-head">
+        <h3>Audit Detail</h3>
+        <button className="ghost small" onClick={onClose}>
+          Tutup
+        </button>
+      </div>
+      <div className="modal-body">
+        <p className="muted">{formatTimeAgo(item.timestamp)}</p>
+        <h4>{item.label}</h4>
+        <p>
+          Resource:{' '}
+          {item.resource ? `${item.resource.label} (${item.resource.hostname})` : item.resourceId}
+        </p>
+        <p>Actor: {item.actor}</p>
+        <p>Status: {item.action}</p>
+      </div>
+    </div>
+  </div>
+);
+
+const Toast = ({
+  status,
+  onDismiss,
+}: {
+  status: { id: string; type: 'success' | 'error'; message: string };
+  onDismiss: () => void;
+}) => (
+  <div className={`toast ${status.type}`}>
+    <p>{status.message}</p>
+    <button className="ghost small" onClick={onDismiss}>
+      Tutup
+    </button>
+  </div>
 );
 
 export default App;
